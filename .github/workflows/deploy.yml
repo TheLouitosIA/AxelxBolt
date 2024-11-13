@@ -1,0 +1,55 @@
+name: Déploiement sur Serveur Personnel
+
+on:
+  push:
+    branches:
+      - main  # Déclenchement lors de push sur la branche principale
+  workflow_dispatch:  # Permet le déclenchement manuel du workflow
+
+jobs:
+  deploy:
+    runs-on: [self-hosted]
+    steps:
+      - name: Cloner le dépôt
+        uses: actions/checkout@v2
+
+      - name: Setup Python environment on Windows
+        if: ${{ runner.os == 'Windows' }}
+        run: |
+          python -m venv venv
+          .\venv\Scripts\Activate
+          
+      - name: Setup Python environment on Unix
+        if: ${{ runner.os != 'Windows' }}
+        run: |
+          python -m venv venv
+          source venv/bin/activate
+          
+      - name: Installer les dépendances
+        run: |
+          venv\Scripts\pip install -r requirements.txt
+
+      - name: Démarrer l'application FastAPI avec ngrok
+        shell: bash
+        run: |
+          chmod +x start_app.sh
+          ./start_app.sh &
+
+      - name: Setup Node.js environment
+        uses: actions/setup-node@v2
+        with:
+          node-version: '16'
+
+      - name: Installer les dépendances du frontend
+        run: |
+          cd frontend
+          npm install
+
+      - name: Construire l’application React
+        run: |
+          cd frontend
+          npm run build
+
+      - name: Déployer l’application frontend
+        run: |
+          cp -r frontend/build/* "E:/AXELIA/frontend"
