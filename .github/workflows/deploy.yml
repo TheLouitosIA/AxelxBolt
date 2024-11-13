@@ -9,25 +9,26 @@ on:
 jobs:
   deploy:
     runs-on: [self-hosted]
+
     steps:
       - name: Cloner le dépôt
         uses: actions/checkout@v2
 
       - name: Setup Python environment on Windows
         if: ${{ runner.os == 'Windows' }}
+        shell: cmd
         run: |
           python -m venv venv
-          .\venv\Scripts\Activate
-          
+          venv\Scripts\activate
+          venv\Scripts\pip install -r requirements.txt
+
       - name: Setup Python environment on Unix
         if: ${{ runner.os != 'Windows' }}
+        shell: bash
         run: |
           python -m venv venv
           source venv/bin/activate
-          
-      - name: Installer les dépendances
-        run: |
-          venv\Scripts\pip install -r requirements.txt
+          pip install -r requirements.txt
 
       - name: Démarrer l'application FastAPI avec ngrok
         shell: bash
@@ -36,7 +37,7 @@ jobs:
           ./start_app.sh &
 
       - name: Setup Node.js environment
-        uses: actions/setup-node@v2
+        uses: actions/setup-node@v3  # Mise à jour vers v3 pour éviter des problèmes d'extraction
         with:
           node-version: '16'
 
