@@ -37,9 +37,10 @@ jobs:
           ./start_app.sh &
 
       - name: Setup Node.js environment
-        uses: actions/setup-node@v3  # Mise à jour vers v3 pour éviter des problèmes d'extraction
+        uses: actions/setup-node@v3
         with:
           node-version: '16'
+          cache: 'npm'
 
       - name: Installer les dépendances du frontend
         run: |
