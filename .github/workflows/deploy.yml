@@ -43,19 +43,20 @@ jobs:
           Expand-Archive -Path "node.zip" -DestinationPath "$env:ProgramFiles\nodejs"
           $env:Path += ";$env:ProgramFiles\nodejs"
           node -v  # Vérifie que Node.js est bien installé
-
-      - name: Clean up existing frontend build
+          
+      - name: Installer les dépendances du frontend
         run: |
-          Remove-Item -Recurse -Force "E:/AXELIA/frontend/*"
-
-      - name: Déployer l’application frontend
-        run: |
-          cp -r frontend/build/* "E:/AXELIA/frontend"
+          cd frontend
+          npm install
 
       - name: Construire l’application React
         run: |
           cd frontend
           npm run build
+
+      - name: Clean up existing frontend build
+        run: |
+          Remove-Item -Recurse -Force "E:/AXELIA/frontend/*"
 
       - name: Déployer l’application frontend
         run: |
