@@ -36,11 +36,10 @@ jobs:
           chmod +x start_app.sh
           ./start_app.sh &
           
-      - name: Download and Install Node.js Manually
-        if: ${{ runner.os == 'Windows' }}
+      - name: Télécharger et installer Node.js
         run: |
           Invoke-WebRequest -Uri "https://nodejs.org/dist/v16.20.2/node-v16.20.2-win-x64.zip" -OutFile "node.zip"
-          Expand-Archive -Path "node.zip" -DestinationPath "$env:ProgramFiles\nodejs"
+          Expand-Archive -Path "node.zip" -DestinationPath "$env:ProgramFiles\nodejs" -Force
           $env:Path += ";$env:ProgramFiles\nodejs"
           node -v  # Vérifie que Node.js est bien installé
           
