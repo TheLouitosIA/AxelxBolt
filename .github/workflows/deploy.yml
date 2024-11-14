@@ -44,12 +44,13 @@ jobs:
           $env:Path += ";$env:ProgramFiles\nodejs"
           node -v  # Vérifie que Node.js est bien installé
 
-
-
-      - name: Installer les dépendances du frontend
+      - name: Clean up existing frontend build
         run: |
-          cd frontend
-          npm install
+          Remove-Item -Recurse -Force "E:/AXELIA/frontend/*"
+
+      - name: Déployer l’application frontend
+        run: |
+          cp -r frontend/build/* "E:/AXELIA/frontend"
 
       - name: Construire l’application React
         run: |
