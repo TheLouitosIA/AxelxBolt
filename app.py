@@ -13,6 +13,10 @@ import hashlib
 from jose import JWTError, jwt
 import re
 from typing import Optional
+from uuid import uuid4
+from detect import detect_image, validate_detection
+import easyocr  # Import EasyOCR
+from difflib import SequenceMatcher
 
 app = FastAPI()
 date_prise = datetime.now().isoformat()  # Format ISO pour la date et heure actuelle
@@ -73,45 +77,64 @@ def verify_token(x_api_token: str = Header(...)):
 
 def verifier_photos_mensuelles(utilisateur_id: int, mois: str):
     try:
+        # Calcul des dates de début et de fin pour le mois
         date_debut = datetime.strptime(mois, "%Y-%m")
         date_fin = (date_debut.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
 
         conn = get_connection()
         cur = conn.cursor()
-        
+
+        # Liste des types de photos requis
         types_photos_requis = ["face", "droite", "gauche", "plaque", "compteur"]
-        photos_non_conformes = []
-        
+        photos_valides = set()  # Pour collecter les types validés
+
+        # Vérification pour chaque type requis
         for type_photo in types_photos_requis:
             query = """
-                SELECT statut_validation FROM photos
-                WHERE utilisateur_id = %s AND type_photo = %s AND date_prise >= %s AND date_prise <= %s
+                SELECT COUNT(*)
+                FROM photos
+                WHERE utilisateur_id = %s
+                  AND type_photo = %s
+                  AND date_prise BETWEEN %s AND %s
+                  AND statut_validation = 'validé'
             """
             cur.execute(query, (utilisateur_id, type_photo, date_debut, date_fin))
             result = cur.fetchone()
 
-            if not result:
-                photos_non_conformes.append({"type_photo": type_photo, "probleme": "Photo manquante"})
-            elif result[0] != "validé":
-                photos_non_conformes.append({"type_photo": type_photo, "probleme": "Photo non conforme"})
+            # Ajout au set des types validés si au moins une photo est correcte
+            if result and result[0] > 0:
+                photos_valides.add(type_photo)
 
-        if photos_non_conformes:
-            message = f"Photos non conformes pour {mois}: " + ", ".join(
-                [f"{p['type_photo']} ({p['probleme']})" for p in photos_non_conformes]
-            )
+        # Vérifier si tous les types requis sont validés
+        if set(types_photos_requis) == photos_valides:
+            query = """
+                INSERT INTO validations (utilisateur_id, mois_verification, resultat)
+                VALUES (%s, %s, TRUE)
+                ON CONFLICT (utilisateur_id, mois_verification)
+                DO UPDATE SET resultat = TRUE
+            """
+            cur.execute(query, (utilisateur_id, mois))
+        else:
+            # Notification des types manquants/non conformes
+            types_non_valides = set(types_photos_requis) - photos_valides
+            message = f"Photos non conformes ou manquantes pour les types : {', '.join(types_non_valides)}."
             notification_query = """
                 INSERT INTO notifications (utilisateur_id, mois, message)
                 VALUES (%s, %s, %s)
             """
             cur.execute(notification_query, (utilisateur_id, mois, message))
-            conn.commit()
 
+        conn.commit()
         cur.close()
         conn.close()
 
-        return {"photos_non_conformes": photos_non_conformes} if photos_non_conformes else {"message": "Toutes les photos sont conformes"}
+        return {
+            "validation_status": "validé" if set(types_photos_requis) == photos_valides else "non validé",
+            "types_valides": list(photos_valides),
+            "types_non_valides": list(set(types_photos_requis) - photos_valides),
+        }
     except Exception as e:
-        return {"error": f"Erreur lors de la vérification des photos mensuelles : {e}"}
+        return {"error": f"Erreur lors de la vérification des photos mensuelles : {e}"} 
 
 # Clé secrète et algorithme pour JWT
 SECRET_KEY = "secret_key_for_token"  # Utilisez une clé secrète forte pour la production
@@ -145,6 +168,19 @@ def verify_access_token(token: str, credentials_exception):
 # Fonction pour hacher les mots de passe
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
+
+def normalize_plate(plate):
+    """
+    Nettoie une plaque en supprimant les caractères inutiles et en mettant en majuscules.
+    """
+    return re.sub(r'[^A-Z0-9]', '', plate.upper())  # Conserve uniquement lettres et chiffres
+
+def is_similar(plate1, plate2, threshold=0.8):
+    """
+    Compare deux plaques d'immatriculation et retourne True si elles sont similaires au-dessus du seuil donné.
+    """
+    similarity = SequenceMatcher(None, plate1, plate2).ratio()
+    return similarity >= threshold
 
 # Route d'inscription
 @app.post("/inscription/", summary="Inscription d'un nouvel utilisateur")
@@ -298,39 +334,95 @@ async def ajouter_validation(validation: Validation):
     except Exception as e:
         return {"error": f"Erreur lors de l'ajout de la validation : {e}"}
 
-
-from datetime import datetime
-
 @app.post("/detect/")
 async def detect_vehicle(utilisateur_id: int, type_photo: str, image: UploadFile = File(...)):
+    """
+    Analyse une photo, détecte les éléments avec YOLO, applique l'OCR pour les plaques,
+    et compare la plaque détectée avec celle enregistrée pour l'utilisateur dans la base de données.
+    """
     temp_dir = "temp"
     if not os.path.exists(temp_dir):
         os.makedirs(temp_dir)
 
     image_path = os.path.join(temp_dir, image.filename)
     try:
+        # Enregistrement temporaire de l'image
         with open(image_path, "wb") as buffer:
             buffer.write(await image.read())
 
+        # Lecture de l'image en tant que tableau numpy
         image_np = cv2.imread(image_path)
-        results = detect.detect_image(image_np)
-        is_valid = detect.validate_detection(type_photo, results)
+
+        # Initialisation d'EasyOCR
+        ocr_reader = easyocr.Reader(['en'], gpu=True)
+
+        # Détection des éléments sur l'image
+        results = detect_image(image_np)
+
+        # Récupérer la plaque d'immatriculation de l'utilisateur depuis la base
+        conn = get_connection()
+        cur = conn.cursor()
+        query = """
+            SELECT plaque_immatriculation FROM utilisateurs WHERE id = %s
+        """
+        cur.execute(query, (utilisateur_id,))
+        user_data = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if not user_data:
+            raise HTTPException(status_code=404, detail="Utilisateur introuvable")
+
+        registered_plate = user_data[0]  # La plaque enregistrée pour l'utilisateur
+        registered_plate_normalized = normalize_plate(registered_plate)  # Normalisation
+
+        # Résultats OCR
+        ocr_results = []
+        for result in results:
+            # Appliquer l'OCR uniquement pour les détections de classe 2 (plaque)
+            if result.get("class") == 2:
+                x1, y1, x2, y2 = result["bbox"]
+                cropped_img = image_np[y1:y2, x1:x2]  # Découper la région de la plaque
+                ocr_texts = ocr_reader.readtext(cropped_img, detail=0)  # OCR avec EasyOCR
+                ocr_text = ocr_texts[0] if ocr_texts else None
+                ocr_text_normalized = normalize_plate(ocr_text) if ocr_text else None  # Normalisation
+
+                # Ajouter le texte OCR au résultat avec normalisation
+                result["text"] = ocr_text
+                result["text_normalized"] = ocr_text_normalized
+                if ocr_text:
+                    ocr_results.append({
+                        "bbox": result["bbox"],
+                        "confidence": result["confidence"],
+                        "class_id": result["class"],
+                        "text": ocr_text,
+                        "text_normalized": ocr_text_normalized
+                    })
+
+        # Validation des plaques détectées avec tolérance
+        is_valid = any(
+            is_similar(registered_plate_normalized, result["text_normalized"])
+            for result in ocr_results
+        )
         validation_status = "validé" if is_valid else "non validé"
 
+        # Formatage des résultats pour stockage
         results_formatted = [
             {
-                "bbox": result["bbox"],
-                "confidence": round(result["confidence"], 2),
-                "class_id": result["class"]
+                "bbox": result.get("bbox", []),
+                "confidence": round(result.get("confidence", 0), 2),
+                "class_id": result.get("class"),
+                "text": result.get("text", None)
             }
             for result in results
         ]
-        
+
+        # Sérialisation des résultats pour la base de données
         results_json = json.dumps(results_formatted)
         conn = get_connection()
         cur = conn.cursor()
 
-        # Insertion de la photo avec son statut de validation
+        # Enregistrement dans la base de données
         date_prise = datetime.now().isoformat()
         mois_verification = datetime.now().strftime("%Y-%m")
         query = """
@@ -346,36 +438,30 @@ async def detect_vehicle(utilisateur_id: int, type_photo: str, image: UploadFile
             validation_status
         ))
 
-        # Vérification si toutes les photos requises pour le mois sont validées
-        cur.execute("""
-            SELECT COUNT(*)
-            FROM photos
-            WHERE utilisateur_id = %s AND TO_CHAR(date_prise, 'YYYY-MM') = %s AND statut_validation = 'validé'
-        """, (utilisateur_id, mois_verification))
+        # Vérification des photos mensuelles pour l'utilisateur
+        verifier_photos_mensuelles(utilisateur_id, mois_verification)
 
-
-        photos_valides = cur.fetchone()[0]
-        if photos_valides >= 4:  # Par exemple, 4 sur 5 photos doivent être validées (sauf "compteur")
-            # Insère ou met à jour la validation mensuelle si toutes les photos sont validées
-            cur.execute("""
-                INSERT INTO validations (utilisateur_id, mois_verification, resultat)
-                VALUES (%s, %s, TRUE)
-                ON CONFLICT (utilisateur_id, mois_verification)
-                DO UPDATE SET resultat = TRUE
-            """, (utilisateur_id, mois_verification))
-
+        # Sauvegarde des modifications
         conn.commit()
         cur.close()
         conn.close()
+
     except Exception as e:
         return {"error": f"Erreur lors de l'ajout de la photo : {e}"}
     finally:
+        # Suppression de l'image temporaire
         os.remove(image_path)
 
     return {
+        "utilisateur_id": utilisateur_id,
+        "type_photo": type_photo,
+        "validation_status": validation_status,
+        "registered_plate": registered_plate,
+        "registered_plate_normalized": registered_plate_normalized,
         "detections": results_formatted,
-        "validation_status": validation_status
+        "ocr_results": ocr_results
     }
+
 
 @app.get("/suivi_validations/")
 async def suivi_validations(utilisateur_id: int, mois: str = Query(None, description="Format YYYY-MM")):
@@ -671,3 +757,86 @@ async def http_exception_handler(request, exc):
         status_code=exc.status_code,
         content={"error": exc.detail},
     )
+
+@app.get("/")
+async def root():
+    return {"message": "API Chauffeurs est opérationnelle"}
+
+# Gestion des erreurs globales
+@app.exception_handler(Exception)
+async def exception_handler(request, exc):
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Une erreur interne est survenue", "details": str(exc)},
+    )
+
+@app.post("/mot_de_passe_oublie/")
+async def mot_de_passe_oublie(email: EmailStr):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        
+        # Vérifie si l'utilisateur existe
+        query = "SELECT id FROM utilisateurs WHERE email = %s"
+        cur.execute(query, (email,))
+        utilisateur = cur.fetchone()
+
+        if not utilisateur:
+            return {"error": "Aucun utilisateur trouvé avec cet email."}
+
+        utilisateur_id = utilisateur[0]
+        token = str(uuid4())  # Génère un jeton unique
+        date_expiration = datetime.utcnow() + timedelta(hours=1)  # Valide 1 heure
+
+        # Insère le jeton dans la base
+        query = """
+            INSERT INTO reset_tokens (utilisateur_id, token, date_expiration)
+            VALUES (%s, %s, %s)
+        """
+        cur.execute(query, (utilisateur_id, token, date_expiration))
+        conn.commit()
+
+        # Simule l'envoi d'un email (dans la vraie vie, utiliser un service d'email)
+        reset_url = f"http://localhost:3000/reset/{token}"
+        print(f"Lien de réinitialisation : {reset_url}")
+
+        cur.close()
+        conn.close()
+        return {"message": "Lien de réinitialisation envoyé à votre email."}
+    except Exception as e:
+        return {"error": f"Erreur lors de la génération du lien de réinitialisation : {e}"}
+
+@app.post("/reset_password/")
+async def reset_password(token: str, new_password: str):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+
+        # Vérifie le jeton
+        query = """
+            SELECT utilisateur_id FROM reset_tokens
+            WHERE token = %s AND date_expiration > %s
+        """
+        cur.execute(query, (token, datetime.utcnow()))
+        utilisateur = cur.fetchone()
+
+        if not utilisateur:
+            return {"error": "Jeton invalide ou expiré."}
+
+        utilisateur_id = utilisateur[0]
+        hashed_password = hash_password(new_password)
+
+        # Met à jour le mot de passe de l'utilisateur
+        query = "UPDATE utilisateurs SET password = %s WHERE id = %s"
+        cur.execute(query, (hashed_password, utilisateur_id))
+
+        # Supprime le jeton après utilisation
+        query = "DELETE FROM reset_tokens WHERE token = %s"
+        cur.execute(query, (token,))
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {"message": "Mot de passe réinitialisé avec succès."}
+    except Exception as e:
+        return {"error": f"Erreur lors de la réinitialisation du mot de passe : {e}"}
