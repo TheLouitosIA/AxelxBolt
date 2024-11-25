@@ -9,6 +9,10 @@ from utils.general import non_max_suppression, scale_boxes
 from utils.plots import Annotator
 from utils.torch_utils import select_device
 import numpy as np
+import easyocr  # Import de la bibliothèque OCR
+import psycopg2
+from difflib import SequenceMatcher
+import re
 
 
 FILE = Path(__file__).resolve()
@@ -23,7 +27,6 @@ from utils.general import (LOGGER, Profile, check_file, check_img_size, check_im
                            increment_path, non_max_suppression, print_args, scale_boxes, strip_optimizer, xyxy2xywh)
 from utils.plots import Annotator, colors, save_one_box
 from utils.torch_utils import select_device, smart_inference_mode
-
 
 @smart_inference_mode()
 def run(
@@ -55,6 +58,10 @@ def run(
         dnn=False,  # use OpenCV DNN for ONNX inference
         vid_stride=1,  # video frame-rate stride
 ):
+    import easyocr  # Import EasyOCR pour OCR
+    ocr_reader = easyocr.Reader(['en'], gpu=True)  # Initialisation de l'OCR
+    ocr_results = []  # Liste pour stocker les résultats OCR
+
     source = str(source)
     save_img = not nosave and not source.endswith('.txt')  # save inference images
     is_file = Path(source).suffix[1:] in (IMG_FORMATS + VID_FORMATS)
@@ -71,7 +78,6 @@ def run(
     # Load model
     device = select_device(device)
     model = DetectMultiBackend(weights, device=device, dnn=dnn, data=data, fp16=half)
-    model.warmup(imgsz=(1, 3, 640, 640))  # Préchauffage du modèle
     stride, names, pt = model.stride, model.names, model.pt
     imgsz = check_img_size(imgsz, s=stride)  # check image size
 
@@ -108,9 +114,6 @@ def run(
             pred = pred[0][1] if isinstance(pred[0], list) else pred[0]
             pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
 
-        # Second-stage classifier (optional)
-        # pred = utils.general.apply_classifier(pred, classifier_model, im, im0s)
-
         # Process predictions
         for i, det in enumerate(pred):  # per image
             seen += 1
@@ -143,6 +146,23 @@ def run(
                         line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
                         with open(f'{txt_path}.txt', 'a') as f:
                             f.write(('%g ' * len(line)).rstrip() % line + '\n')
+
+                    # OCR for license plates
+                    if int(cls) == 2:  # Classe correspondant aux plaques
+                        x1, y1, x2, y2 = map(int, xyxy)
+                        cropped_img = im0[y1:y2, x1:x2]  # Découpe l'image de la plaque
+                        ocr_result = ocr_reader.readtext(cropped_img, detail=0)  # Applique EasyOCR
+                        LOGGER.info(f'OCR Result: {ocr_result}')  # Log des résultats OCR
+                        ocr_results.append({
+                            "bbox": [x1, y1, x2, y2],
+                            "text": ocr_result,
+                            "confidence": conf.item()
+                        })
+
+                        # Annoter l'image avec le texte OCR
+                        if ocr_result:
+                            label = f'{ocr_result[0]}'  # Texte détecté
+                            annotator.box_label(xyxy, label, color=colors(int(cls), True))
 
                     if save_img or save_crop or view_img:  # Add bbox to image
                         c = int(cls)  # integer class
@@ -192,6 +212,8 @@ def run(
     if update:
         strip_optimizer(weights[0])  # update model (to fix SourceChangeWarning)
 
+    return ocr_results  # Retour des résultats OCR
+
 
 def parse_opt():
     parser = argparse.ArgumentParser()
@@ -233,6 +255,18 @@ device = select_device('')
 model = DetectMultiBackend('E:/AXELIA/runs/train/exp3/weights/best.pt', device=device)
 model.warmup(imgsz=(1, 3, 640, 640))  # Préchauffage du modèle
 
+def is_similar(plate1, plate2, threshold=0.8):
+    """
+    Compare deux plaques d'immatriculation et retourne True si elles sont similaires au-dessus du seuil donné.
+    """
+    similarity = SequenceMatcher(None, plate1, plate2).ratio()
+    return similarity >= threshold
+
+def normalize_plate(plate):
+    """
+    Nettoie la plaque d'immatriculation en supprimant les caractères spéciaux.
+    """
+    return re.sub(r'[^A-Z0-9]', '', plate.upper())  # Conserve uniquement les lettres et chiffres
 
 def detect_image(image_np, conf_thres=0.25, iou_thres=0.45):
     # Vérifie si l'image est en couleur et a 3 canaux
@@ -263,48 +297,87 @@ def detect_image(image_np, conf_thres=0.25, iou_thres=0.45):
                 })
     return results
 
-def validate_detection(type_photo, results):
-    # Critères pour chaque type de photo
+def validate_detection(type_photo, results, utilisateur_id):
+    """
+    Valide les résultats de détection en fonction des critères et compare la plaque avec celle en base.
+    """
+    # Connexion à la base pour récupérer la plaque de l'utilisateur
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        query = """
+            SELECT plaque_immatriculation
+            FROM utilisateurs
+            WHERE id = %s
+        """
+        cur.execute(query, (utilisateur_id,))
+        utilisateur = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if not utilisateur:
+            print(f"Utilisateur avec ID {utilisateur_id} non trouvé.")
+            return False
+
+        plaque_attendue = utilisateur[0].replace(" ", "").upper()  # Suppression des espaces et mise en majuscule
+
+    except Exception as e:
+        print(f"Erreur lors de la récupération de la plaque utilisateur : {e}")
+        return False
+
+    # Critères de validation pour chaque type de photo
     criteria = {
         "face": {"class_id": 2, "confidence": 0.70},
-        "droite": {"class_id": 1, "confidence": 0.70},
-        "gauche": {"class_id": 0, "confidence": 0.70},
+        "droite": {"class_id": 1, "confidence": 0.60},
+        "gauche": {"class_id": 0, "confidence": 0.60},
         "plaque": [
             {"class_id": 2, "confidence": 0.70},
-            {"class_id": [0, 1], "confidence": 0.70}
+            {"class_id": [0, 1], "confidence": 0.60}
         ],
-        "compteur": {}  # Aucun critère
+        "compteur": {}  # Aucun critère pour le compteur
     }
 
-    # Initialisation de la validation
+    # Vérification du type de photo
     valid = False
-    print(f"Type de photo: {type_photo}")
+    print(f"Type de photo : {type_photo}")
     print("Résultats de détection :", results)
 
-    # Cas particulier pour "compteur" (toujours validé)
+    # Cas particulier pour les photos "compteur"
     if type_photo == "compteur":
         print("Aucun critère pour le compteur, validé automatiquement.")
         return True
 
-    # Vérification des critères selon le type de photo
+    # Vérification pour les autres types de photo
     if type_photo in criteria:
         crit = criteria[type_photo]
-        if type_photo == "plaque":
-            # Vérification spéciale pour la photo avec plaque + côté
-            has_class_2 = any(res["class"] == 2 and res["confidence"] >= crit[0]["confidence"] for res in results)
-            has_class_0_1 = any(res["class"] in crit[1]["class_id"] and res["confidence"] >= crit[1]["confidence"] for res in results)
-            
-            # Log pour diagnostic
-            print("Vérification pour 'plaque' :")
-            print("Classe 2 présente avec confiance requise :", has_class_2)
-            print("Classe 0 ou 1 présente avec confiance requise :", has_class_0_1)
 
-            # Validation si les deux conditions sont remplies
-            valid = has_class_2 and has_class_0_1
+        if type_photo == "plaque":
+            # Vérification OCR pour les plaques
+            ocr_results = [res["text"] for res in results if "text" in res]
+            # Vérification OCR pour les plaques
+            ocr_results = [res["text"].replace(" ", "").upper() for res in results if "text" in res]  # Normalisation
+            # Normalisation des plaques
+            plaque_attendue = normalize_plate(plaque_attendue)
+            ocr_results = [normalize_plate(res["text"]) for res in results if "text" in res]
+
+            print(f"Plaques détectées par OCR (normalisées) : {ocr_results}")
+            print(f"Plaque attendue (normalisée) : {plaque_attendue}")
+
+            # Vérification si la plaque attendue est détectée avec tolérance
+            valid = any(is_similar(plaque_attendue, ocr_result) for ocr_result in ocr_results)
+
+            if valid:
+                print(f"Validation réussie : {plaque_attendue} correspond à {ocr_results}.")
+            else:
+                print(f"Validation échouée : aucune correspondance suffisante pour {plaque_attendue}.")
+
         else:
-            # Vérification des critères simples (face, droite, gauche)
-            valid = any(res["class"] == crit["class_id"] and res["confidence"] >= crit["confidence"] for res in results)
-            print(f"Validation pour {type_photo} avec critère {crit}: {valid}")
+            # Validation pour d'autres types de photo basées sur les classes et confiances
+            valid = any(
+                res["class"] == crit["class_id"] and res["confidence"] >= crit["confidence"]
+                for res in results
+            )
+            print(f"Validation pour {type_photo} avec critère {crit} : {valid}")
 
     print("Statut de validation final :", "Validé" if valid else "Non validé")
     return valid
